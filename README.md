@@ -9,14 +9,17 @@ Library:
   server from a Test Agent, the files on its shares, serving a share
   from the agent, and reading a server as a security posture — on
   Linux, macOS and Windows.
-  - `tapi_smb` — backends, targets, listing a server's shares, and what
-    a connection negotiated;
+  - `tapi_smb` — backends, targets, listing a server's shares, what a
+    connection negotiated, and whether a share exposes the CIFS UNIX
+    extensions;
   - `tapi_smb_file` — files on a share: put, get, list, read, write,
-    make and remove directories, remove a file;
+    make and remove directories, remove a file, and — over the UNIX
+    extensions — make a POSIX symlink and read a path's owner and mode;
   - `tapi_smb_share` — a share served from the agent, so one agent
     serves and another connects;
-  - `tapi_smb_audit` — a server read as a security posture, reported
-    through tsf-cybersec.
+  - `tapi_smb_audit` — a server read as a security posture, from what it
+    negotiates to whether a guest's reach escalates to arbitrary read
+    and write as root, reported through tsf-cybersec.
 
 TE has no SMB of its own.
 
@@ -90,6 +93,7 @@ library's own tests, one agent doing both against `localhost`.
 | require encryption | yes | yes | yes |
 | what the connection negotiated | yes | yes | yes |
 | serve a share | yes | no | yes |
+| POSIX symlink and stat (UNIX extensions) | yes | no | no |
 
 - **Samba** — Linux and the BSDs: `smbclient` for the client, `net
   usershare` and `testparm` for a server, one command per operation so
@@ -165,6 +169,11 @@ dialect and reads back what was accepted, signed and encrypted.
 | `smb.no-encryption` | medium | it offers no SMB3 dialect, so nothing is encrypted |
 | `smb.anonymous-shares` | medium | a null session lists its shares |
 | `smb.guest-writable` | high | a guest login can write to a share |
+| `smb.unix-extensions` | low | a share exposes CIFS UNIX extensions to a guest |
+| `smb.symlink-traversal` | high | a symlink in the share is followed out of it |
+| `smb.guest-privileged` | critical | a file the guest creates is owned by uid 0 |
+| `smb.arbitrary-read` | critical | a privileged, out-of-share file is readable through the escape |
+| `smb.arbitrary-write` | critical | a file is written out of the share through the escape |
 | `smb.not-assessed` | info | the negotiation could not be done (no python3) |
 
 `smb.smb1-enabled` is the one worth knowing about: SMB1 is the protocol
@@ -172,6 +181,41 @@ WannaCry spread over, it has no real integrity protection, and a
 current Samba and Windows have it off by default. A server that answers
 it was turned back on for something that should have been fixed another
 way.
+
+### From reachability to consequence
+
+The first findings prove a server is *reachable*; the five from
+`smb.unix-extensions` down prove what that reach is *worth*, and turn a
+"guest can connect" into "guest is root". They run only when the policy
+names a share to try them against (`access_share`, or `guest_share`),
+because they plant and remove names on it. As a guest, over SMB1, on
+that one share, the audit asks in turn:
+
+1. **UNIX extensions.** Does the share expose the CIFS UNIX extensions
+   to a guest — the thing a symlink is built out of? Without them the
+   chain stops, since there is nothing to escape with.
+2. **Identity.** A file the guest creates is stat'd back: whom does it
+   belong to? `uid 0` means the guest session operates as root, not a
+   squashed user — `smb.guest-privileged`.
+3. **Escape.** A symlink is made in the share pointing at a benign file
+   outside it (`/etc/hostname` by default). If its bytes come back, the
+   server followed the link out of the share — `wide links`, the
+   CVE-2010-0926 class, `smb.symlink-traversal`.
+4. **Arbitrary read.** The same escape aimed at a privileged, owner-only
+   file (a shadow file by default). Reading it means the session is that
+   owner — `smb.arbitrary-read`. Only the file's mode is reported as
+   evidence; no byte of its contents ever is.
+5. **Arbitrary write.** A symlink to a throwaway path outside the share,
+   written through and read back to confirm it landed —
+   `smb.arbitrary-write`.
+
+Each step has a hardened-server control built in: a server with
+`wide links = no` and a squashed guest fails the step, and a clean audit
+means the server *refused*, not that the audit stopped at "can connect".
+The links the chain plants are taken down with a POSIX unlink, which
+removes the link itself and never the file it points to; the one
+throwaway marker written outside the share is removed as far as the
+escape allows.
 
 The negotiate helper's answers were checked against `nmap --script
 smb2-security-mode,smb-protocols`: where nmap reported "Message signing
@@ -205,6 +249,20 @@ passed:
   guest-writable `public` share, `smb.guest-writable`. The negotiate
   helper's SMB1/signing findings were cross-checked against `nmap`.
 
+**The access-rights chain — written and syntax-checked, not yet run
+through an agent.** `tapi_smb_unix_extensions()`, `tapi_smb_symlink()`,
+`tapi_smb_stat()` (getfacl over the UNIX extensions) and the five
+consequence findings from `smb.unix-extensions` down were built against
+smbclient's documented POSIX commands and the wide-links behaviour of
+Samba 3.x, but the agent-run verification is still owed. They belong in
+the same `audit` group: a control server hardened with `wide links = no`
+and a squashed guest to prove each finding stays clean, and one left on
+the insecure 3.x defaults to prove each one fires. `tapi_smb_stat()`
+reads the numeric owner and the u/g/o mode from `getfacl`, which is
+stable where smbclient's `stat` output has drifted between versions; if
+a target server words it differently, that parser is the first place to
+look.
+
 **macOS (client) — command shapes verified live, not through an agent.**
 `smbutil view`, `mount_smbfs`, `smbutil statshares` and the negotiate
 helper were run on a real Mac against a Samba server: shares listed,
@@ -232,3 +290,12 @@ on. The scripts name their own failures (`SMBERR`, `NOPRINTER`,
   guest-writable check, one write it removes again, it sends nothing —
   it does not try an administrative operation to see whether it is
   allowed.
+- **The access-rights chain does more, and only on request.** It runs
+  only when the policy names a share for it, and then it creates
+  symlinks on that share, reads whatever a working escape reaches — up
+  to a privileged owner-only file, whose contents it discards without
+  reporting — and writes one throwaway marker outside the share. Every
+  link is removed with a POSIX unlink that never follows it, so an
+  out-of-share file is never touched by the cleanup; the single marker
+  is removed as far as the escape allows. Point it only at a server you
+  are authorised to assess.

@@ -214,6 +214,186 @@ out:
     return rc;
 }
 
+/** The names the chain plants on the share; all removed again. */
+#define SMB_PROBE_ID_FILE   "tsf_smb_id_probe"
+#define SMB_PROBE_OUT_LINK  "tsf_smb_out_probe"
+#define SMB_PROBE_SEC_LINK  "tsf_smb_sec_probe"
+#define SMB_PROBE_W_LINK    "tsf_smb_w_probe"
+
+/**
+ * The access-rights chain: as a guest, over SMB1, on one share, ask
+ * what the reach is worth - the UNIX extensions, a symlink out of the
+ * share, the guest's uid, an out-of-share read, an out-of-share write.
+ * Each finding has a hardened-server control: a server that squashes
+ * the guest and refuses wide links simply fails the step and nothing
+ * is reported.
+ */
+static void
+smb_audit_access(tapi_job_factory_t *factory, tapi_smb_backend backend,
+                 const tapi_smb_target *target, const tapi_smb_policy *policy,
+                 int timeout_ms, tapi_cybersec_report *report)
+{
+    const char *share = policy->access_share != NULL ?
+                        policy->access_share : policy->guest_share;
+    const char *outside = policy->outside_path != NULL ?
+                          policy->outside_path : "/etc/hostname";
+    const char *secret = policy->secret_path != NULL ?
+                         policy->secret_path : "/etc/shadow";
+    const char *write_path = policy->write_path != NULL ?
+                             policy->write_path : "/tmp/tsf_smb_write_probe";
+    tapi_smb_target guest = *target;
+    tapi_smb_backend be = backend;
+
+    if (share == NULL)
+        return;
+    if (tapi_smb_resolve(factory, timeout_ms, &be) != 0 ||
+        !tapi_smb_supports(be, TAPI_SMB_FEAT_POSIX))
+    {
+        return;
+    }
+
+    /*
+     * A guest session forced onto SMB1, where the CIFS UNIX extensions
+     * live: no user (a null session the server maps to guest), and the
+     * dialect pinned to NT1 so the extensions can be negotiated at all.
+     */
+    guest.user = NULL;
+    guest.password = NULL;
+    guest.min_dialect = TAPI_SMB_DIALECT_NT1;
+    guest.max_dialect = TAPI_SMB_DIALECT_NT1;
+
+    /* Without the extensions there is no symlink to follow: stop here. */
+    if (!tapi_smb_unix_extensions(factory, be, &guest, share, timeout_ms))
+        return;
+
+    if (!policy->allow_unix_extensions)
+    {
+        tapi_cybersec_report_add(report, TAPI_CYBERSEC_SEV_LOW,
+                                 "smb.unix-extensions", share,
+                                 "The share exposes the CIFS UNIX extensions "
+                                 "to a guest, so a client can make symlinks "
+                                 "and read POSIX ownership on it");
+    }
+
+    /*
+     * Identity: write a file as the guest and read back who owns it. A
+     * server that squashes the guest gives an unprivileged uid; uid 0
+     * means the guest operates as root.
+     */
+    if (tapi_smb_write(factory, be, &guest, share, SMB_PROBE_ID_FILE,
+                       "probe", 5, timeout_ms) == 0)
+    {
+        tapi_smb_stat_info st;
+
+        if (tapi_smb_stat(factory, be, &guest, share, SMB_PROBE_ID_FILE,
+                          timeout_ms, &st) == 0 && st.uid == 0)
+        {
+            tapi_cybersec_report_add(report, TAPI_CYBERSEC_SEV_CRITICAL,
+                                     "smb.guest-privileged", share,
+                                     "A file a guest creates is owned by uid "
+                                     "0, so the guest session operates as "
+                                     "root");
+        }
+        /* An ordinary file the guest made: an ordinary delete removes it. */
+        tapi_smb_unlink(factory, be, &guest, share, SMB_PROBE_ID_FILE,
+                        timeout_ms);
+    }
+
+    /*
+     * Escape: a symlink in the share pointing at a benign file outside
+     * it. If the file's bytes come back, the server followed the link
+     * out of the share - wide links, the CVE-2010-0926 class. The link
+     * is removed with posix_unlink, which never follows it, so the
+     * out-of-share file is untouched.
+     */
+    if (tapi_smb_symlink(factory, be, &guest, share, SMB_PROBE_OUT_LINK,
+                         outside, timeout_ms) == 0)
+    {
+        te_string content = TE_STRING_INIT;
+
+        if (tapi_smb_read(factory, be, &guest, share, SMB_PROBE_OUT_LINK,
+                          timeout_ms, &content) == 0 && content.len != 0 &&
+            !policy->allow_wide_links)
+        {
+            tapi_cybersec_report_add(report, TAPI_CYBERSEC_SEV_HIGH,
+                                     "smb.symlink-traversal", share,
+                                     "A symlink in the share is followed out "
+                                     "of it, so a client reads paths the "
+                                     "share was never meant to reach");
+        }
+        te_string_free(&content);
+        tapi_smb_posix_unlink(factory, be, &guest, share, SMB_PROBE_OUT_LINK,
+                              timeout_ms);
+    }
+
+    /*
+     * Arbitrary read: the same escape aimed at a privileged, owner-only
+     * file. Reading it means the session is that owner (root). Only the
+     * mode is reported as evidence; no byte of the file is.
+     */
+    if (tapi_smb_symlink(factory, be, &guest, share, SMB_PROBE_SEC_LINK,
+                         secret, timeout_ms) == 0)
+    {
+        te_string content = TE_STRING_INIT;
+        tapi_smb_stat_info st;
+        long mode = -1;
+
+        if (tapi_smb_stat(factory, be, &guest, share, SMB_PROBE_SEC_LINK,
+                          timeout_ms, &st) == 0)
+        {
+            mode = st.mode;
+        }
+        if (tapi_smb_read(factory, be, &guest, share, SMB_PROBE_SEC_LINK,
+                          timeout_ms, &content) == 0 && content.len != 0)
+        {
+            tapi_cybersec_report_add(report, TAPI_CYBERSEC_SEV_CRITICAL,
+                                     "smb.arbitrary-read", share,
+                                     "A privileged owner-only file outside "
+                                     "the share (mode %04lo) is readable "
+                                     "through the escape",
+                                     mode >= 0 ? mode : 0L);
+        }
+        te_string_free(&content);
+        tapi_smb_posix_unlink(factory, be, &guest, share, SMB_PROBE_SEC_LINK,
+                              timeout_ms);
+    }
+
+    /*
+     * Arbitrary write: a symlink to a throwaway path outside the share,
+     * written through and read back to confirm it landed. The marker is
+     * removed with an ordinary delete - which follows the link and so
+     * takes down the out-of-share marker, the one place following the
+     * link is what is wanted - and then the link itself with
+     * posix_unlink.
+     */
+    if (tapi_smb_symlink(factory, be, &guest, share, SMB_PROBE_W_LINK,
+                         write_path, timeout_ms) == 0)
+    {
+        static const char marker[] = "tsf-smb-probe";
+        te_string content = TE_STRING_INIT;
+
+        if (tapi_smb_write(factory, be, &guest, share, SMB_PROBE_W_LINK,
+                           marker, sizeof(marker) - 1, timeout_ms) == 0)
+        {
+            if (tapi_smb_read(factory, be, &guest, share, SMB_PROBE_W_LINK,
+                              timeout_ms, &content) == 0 &&
+                strstr(te_string_value(&content), marker) != NULL)
+            {
+                tapi_cybersec_report_add(report, TAPI_CYBERSEC_SEV_CRITICAL,
+                                         "smb.arbitrary-write", share,
+                                         "A file is written outside the share "
+                                         "through the escape");
+            }
+            /* Follows the link to remove the throwaway marker we wrote. */
+            tapi_smb_unlink(factory, be, &guest, share, SMB_PROBE_W_LINK,
+                            timeout_ms);
+        }
+        te_string_free(&content);
+        tapi_smb_posix_unlink(factory, be, &guest, share, SMB_PROBE_W_LINK,
+                              timeout_ms);
+    }
+}
+
 /* See description in tapi_smb_audit.h */
 te_errno
 tapi_smb_audit(tapi_job_factory_t *factory, tapi_smb_backend backend,
@@ -334,6 +514,13 @@ shares:
         }
         te_string_free(&remote);
     }
+
+    /*
+     * The consequence findings: what the reach proved above is actually
+     * worth. Run last, and only where the policy named a share to try,
+     * because they plant and remove names on it.
+     */
+    smb_audit_access(factory, backend, target, policy, timeout_ms, report);
 
     te_string_free(&subject);
 
