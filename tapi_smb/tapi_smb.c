@@ -149,7 +149,7 @@ tapi_smb_features(tapi_smb_backend backend)
             return TAPI_SMB_FEAT_LIST | TAPI_SMB_FEAT_FILES |
                    TAPI_SMB_FEAT_DIALECT | TAPI_SMB_FEAT_SIGNING |
                    TAPI_SMB_FEAT_ENCRYPT | TAPI_SMB_FEAT_NEGOTIATED |
-                   TAPI_SMB_FEAT_SERVE;
+                   TAPI_SMB_FEAT_SERVE | TAPI_SMB_FEAT_POSIX;
 
         case TAPI_SMB_MACOS:
             /*

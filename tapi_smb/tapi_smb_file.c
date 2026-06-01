@@ -916,6 +916,240 @@ tapi_smb_unlink(tapi_job_factory_t *factory, tapi_smb_backend backend,
                        NULL, timeout_ms, NULL);
 }
 
+/* See description in tapi_smb.h */
+bool
+tapi_smb_unix_extensions(tapi_job_factory_t *factory, tapi_smb_backend backend,
+                         const tapi_smb_target *target, const char *share,
+                         int timeout_ms)
+{
+    te_string out = TE_STRING_INIT;
+    te_errno rc;
+    bool yes;
+
+    rc = tapi_smb_resolve(factory, timeout_ms, &backend);
+    if (rc != 0)
+        return false;
+    if (target == NULL || target->server == NULL || share == NULL)
+        return false;
+    if (!tapi_smb_supports(backend, TAPI_SMB_FEAT_POSIX))
+        return false;
+
+    /*
+     * The "posix" command asks smbclient to negotiate the CIFS UNIX
+     * extensions and prints the server's answer: "Server supports CIFS
+     * extensions ..." when they are there, "Server doesn't support
+     * UNIX CIFS extensions" when they are not. The verdict is the text,
+     * not the exit code.
+     */
+    rc = smb_samba_cmd(factory, target, share, "posix", timeout_ms, &out);
+    yes = rc == 0 &&
+          strstr(te_string_value(&out), "supports CIFS extensions") != NULL &&
+          strstr(te_string_value(&out), "doesn't support") == NULL;
+
+    te_string_free(&out);
+
+    return yes;
+}
+
+/* See description in tapi_smb_file.h */
+te_errno
+tapi_smb_symlink(tapi_job_factory_t *factory, tapi_smb_backend backend,
+                 const tapi_smb_target *target, const char *share,
+                 const char *linkname, const char *points_to, int timeout_ms)
+{
+    te_string command = TE_STRING_INIT;
+    te_errno rc;
+
+    rc = tapi_smb_resolve(factory, timeout_ms, &backend);
+    if (rc != 0)
+        return rc;
+    if (target == NULL || target->server == NULL || share == NULL ||
+        linkname == NULL || points_to == NULL)
+    {
+        ERROR("An SMB symlink needs a server, a share, a name and a target");
+        return TE_RC(TE_TAPI, TE_EINVAL);
+    }
+    if (!tapi_smb_supports(backend, TAPI_SMB_FEAT_POSIX))
+    {
+        ERROR("%s has no POSIX/CIFS UNIX extensions to make a symlink with",
+              tapi_smb_backend2str(backend));
+        return TE_RC(TE_TAPI, TE_EOPNOTSUPP);
+    }
+
+    /*
+     * smbclient's posix "symlink <target> <newname>": the first word
+     * is what the link points to, the second is the link. Both are
+     * POSIX paths with forward slashes, so - unlike the ordinary file
+     * commands - they are not turned into backslashes. They are
+     * double-quoted for smbclient's own tokenizer, which is what reads
+     * a -c command.
+     */
+    te_string_append(&command, "posix; symlink ");
+    smb_client_quote(&command, points_to);
+    te_string_append(&command, " ");
+    smb_client_quote(&command, linkname);
+
+    rc = smb_samba_cmd(factory, target, share, command.ptr, timeout_ms, NULL);
+
+    te_string_free(&command);
+
+    return rc;
+}
+
+/* See description in tapi_smb_internal.h */
+te_errno
+tapi_smb_posix_unlink(tapi_job_factory_t *factory, tapi_smb_backend backend,
+                      const tapi_smb_target *target, const char *share,
+                      const char *name, int timeout_ms)
+{
+    te_string command = TE_STRING_INIT;
+    te_errno rc;
+
+    rc = tapi_smb_resolve(factory, timeout_ms, &backend);
+    if (rc != 0)
+        return rc;
+    if (target == NULL || target->server == NULL || share == NULL ||
+        name == NULL)
+    {
+        return TE_RC(TE_TAPI, TE_EINVAL);
+    }
+    if (!tapi_smb_supports(backend, TAPI_SMB_FEAT_POSIX))
+        return TE_RC(TE_TAPI, TE_EOPNOTSUPP);
+
+    /*
+     * posix_unlink removes the name itself, following nothing - so a
+     * symlink node goes and the file it points to is left. This is why
+     * the chain's cleanup uses it and not the ordinary rm.
+     */
+    te_string_append(&command, "posix; posix_unlink ");
+    smb_client_quote(&command, name);
+
+    rc = smb_samba_cmd(factory, target, share, command.ptr, timeout_ms, NULL);
+
+    te_string_free(&command);
+
+    return rc;
+}
+
+/** Read a getfacl permission triple ("rwx", "r--", ...) as three bits. */
+static long
+smb_perm_triple(const char *p)
+{
+    long v = 0;
+
+    if (p[0] == 'r')
+        v |= 4;
+    if (p[1] == 'w')
+        v |= 2;
+    /* x, or the set-id/sticky letters that stand in the execute slot. */
+    if (p[2] == 'x' || p[2] == 's' || p[2] == 'S' || p[2] == 't' ||
+        p[2] == 'T')
+    {
+        v |= 1;
+    }
+
+    return v;
+}
+
+/** Read the number after a getfacl "# owner:"/"# group:" label. */
+static bool
+smb_getfacl_num(const char *text, const char *label, long *value)
+{
+    const char *found = strstr(text, label);
+
+    if (found == NULL)
+        return false;
+
+    found += strlen(label);
+    while (*found == ' ' || *found == '\t')
+        found++;
+
+    return te_strtol_silent(found, 10, value) == 0;
+}
+
+/* See description in tapi_smb_file.h */
+te_errno
+tapi_smb_stat(tapi_job_factory_t *factory, tapi_smb_backend backend,
+              const tapi_smb_target *target, const char *share,
+              const char *remote, int timeout_ms, tapi_smb_stat_info *info)
+{
+    te_string command = TE_STRING_INIT;
+    te_string out = TE_STRING_INIT;
+    const char *text;
+    const char *owner_perm;
+    const char *group_perm;
+    const char *other_perm;
+    te_errno rc;
+
+    if (info == NULL)
+        return TE_RC(TE_TAPI, TE_EINVAL);
+
+    info->uid = -1;
+    info->gid = -1;
+    info->mode = -1;
+    info->size = -1;
+    info->is_dir = false;
+    info->is_symlink = false;
+
+    rc = tapi_smb_resolve(factory, timeout_ms, &backend);
+    if (rc != 0)
+        return rc;
+    if (target == NULL || target->server == NULL || share == NULL ||
+        remote == NULL)
+    {
+        ERROR("An SMB stat needs a server, a share and a path");
+        return TE_RC(TE_TAPI, TE_EINVAL);
+    }
+    if (!tapi_smb_supports(backend, TAPI_SMB_FEAT_POSIX))
+    {
+        ERROR("%s has no POSIX/CIFS UNIX extensions to stat with",
+              tapi_smb_backend2str(backend));
+        return TE_RC(TE_TAPI, TE_EOPNOTSUPP);
+    }
+
+    /*
+     * getfacl over the UNIX extensions prints the numeric owner and
+     * group and a base ACL - the u/g/o permission triples - which is
+     * the owner and the mode this reads. It is a stable, machine-shaped
+     * output across Samba versions, where "stat" has varied. It follows
+     * a symlink to its target, which is what a wide-links check wants:
+     * getfacl of the link that escaped the share reads the file it
+     * reached.
+     */
+    te_string_append(&command, "posix; getfacl ");
+    smb_client_quote(&command, remote);
+
+    rc = smb_samba_cmd(factory, target, share, command.ptr, timeout_ms, &out);
+    if (rc != 0)
+        goto out;
+
+    text = te_string_value(&out);
+    smb_getfacl_num(text, "# owner:", &info->uid);
+    smb_getfacl_num(text, "# group:", &info->gid);
+
+    owner_perm = strstr(text, "user::");
+    group_perm = strstr(text, "group::");
+    other_perm = strstr(text, "other::");
+    if (owner_perm != NULL && group_perm != NULL && other_perm != NULL)
+    {
+        info->mode = (smb_perm_triple(owner_perm + strlen("user::")) << 6) |
+                     (smb_perm_triple(group_perm + strlen("group::")) << 3) |
+                     smb_perm_triple(other_perm + strlen("other::"));
+    }
+
+    if (info->uid == -1 && info->mode == -1)
+    {
+        ERROR("getfacl gave no owner or mode this could read: %s", text);
+        rc = TE_RC(TE_TAPI, TE_EPROTO);
+    }
+
+out:
+    te_string_free(&command);
+    te_string_free(&out);
+
+    return rc;
+}
+
 /* See description in tapi_smb_file.h */
 void
 tapi_smb_dirents_free(te_vec *entries)

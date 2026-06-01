@@ -129,6 +129,12 @@ typedef enum tapi_smb_dialect {
 #define TAPI_SMB_FEAT_NEGOTIATED (1u << 5)
 /** Serve a share from the agent. */
 #define TAPI_SMB_FEAT_SERVE     (1u << 6)
+/**
+ * POSIX / CIFS UNIX extensions on a share: create a symlink in it,
+ * read a file's owner and mode. The one thing a wide-links path
+ * traversal is built out of, and a Samba-only, SMB1-era feature.
+ */
+#define TAPI_SMB_FEAT_POSIX     (1u << 7)
 
 /** A server and the credentials to reach it with. */
 typedef struct tapi_smb_target {
@@ -305,6 +311,33 @@ extern bool tapi_smb_can_connect(tapi_job_factory_t *factory,
                                  const tapi_smb_target *target,
                                  const char *share, int timeout_ms,
                                  te_string *status);
+
+/**
+ * Does the server expose CIFS UNIX extensions on this share?
+ *
+ * The question a wide-links traversal turns on: a server that
+ * advertises the extensions to this session lets a POSIX client
+ * create a symlink in the share and, where @c "wide links" is left on,
+ * follow it out of the share. It is asked by negotiating the
+ * extensions, not read from configuration. Samba only; another
+ * backend answers @c false without asking.
+ *
+ * @note The extensions ride on SMB1, so the answer is @c true only for
+ *       a @p target that reaches the server over SMB1 - set
+ *       @a min_dialect and @a max_dialect to @ref TAPI_SMB_DIALECT_NT1.
+ *
+ * @param factory       Job factory.
+ * @param backend       Backend, or @ref TAPI_SMB_AUTO.
+ * @param target        Server and credentials.
+ * @param share         Share to ask on.
+ * @param timeout_ms    Timeout, ms.
+ *
+ * @return @c true when the share exposes the extensions to @p target.
+ */
+extern bool tapi_smb_unix_extensions(tapi_job_factory_t *factory,
+                                     tapi_smb_backend backend,
+                                     const tapi_smb_target *target,
+                                     const char *share, int timeout_ms);
 
 /**
  * Write connection info into the log.

@@ -134,6 +134,31 @@ extern te_errno tapi_smb_resolve(tapi_job_factory_t *factory, int timeout_ms,
                                  tapi_smb_backend *backend);
 
 /**
+ * POSIX-unlink a name on a share (Samba only).
+ *
+ * The one deletion that removes a symlink itself rather than what it
+ * points to: it is how the access-rights chain takes down the links it
+ * planted without touching the out-of-share files they reach - an
+ * ordinary delete would follow the link. Not public: the chain's own
+ * cleanup uses it, a test drives the share it serves with the ordinary
+ * tapi_smb_unlink().
+ *
+ * @param factory       Job factory.
+ * @param backend       Backend (must have @ref TAPI_SMB_FEAT_POSIX).
+ * @param target        Server and credentials.
+ * @param share         Share name.
+ * @param name          Path on the share, forward slashes.
+ * @param timeout_ms    Timeout, ms.
+ *
+ * @return Status code.
+ */
+extern te_errno tapi_smb_posix_unlink(tapi_job_factory_t *factory,
+                                      tapi_smb_backend backend,
+                                      const tapi_smb_target *target,
+                                      const char *share, const char *name,
+                                      int timeout_ms);
+
+/**
  * Append the smbclient arguments that name the server, the user and
  * the connection requirements of @p target.
  *
